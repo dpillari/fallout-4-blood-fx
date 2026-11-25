@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -46,3 +49,15 @@ jobs:
         with:
           name: BloodFX
           path: out/BloodFX
+
+      - name: Publish release (main only)
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Move-Item out\BloodFX\F4SE\Plugins\BloodFX.pdb BloodFX.pdb
+          Compress-Archive -Path out\BloodFX\* -DestinationPath BloodFX.zip -Force
+          gh release delete latest --yes --cleanup-tag 2>$null
+          $global:LASTEXITCODE = 0
+          gh release create latest BloodFX.zip BloodFX.pdb --title "BloodFX (latest build)" --target ${{ github.sha }} --notes "Automatic build of ${{ github.sha }}. Install BloodFX.zip with a mod manager, or extract it into Fallout 4\Data. Requires F4SE + Address Library for runtime 1.11.240. BloodFX.pdb is only for crash debugging."
