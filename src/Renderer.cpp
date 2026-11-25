@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -180,7 +181,8 @@ namespace BloodFX
 			ComPtr<ID3D11InputLayout>         layout;
 			D3D11_PRIMITIVE_TOPOLOGY          topo{};
 			ComPtr<ID3D11Buffer>              vsCB, psCB, csCB;
-			ID3D11ShaderResourceView*         vsSRV[2]{}, *psSRV[2]{}, *csSRV[2]{};
+			static constexpr UINT             kSlots = 6;
+			ID3D11ShaderResourceView*         vsSRV[kSlots]{}, *psSRV[kSlots]{}, *csSRV[kSlots]{};
 			ComPtr<ID3D11SamplerState>        psSamp, csSamp;
 			ComPtr<ID3D11UnorderedAccessView> csUAV;
 
@@ -200,9 +202,9 @@ namespace BloodFX
 				c->VSGetConstantBuffers(0, 1, &vsCB);
 				c->PSGetConstantBuffers(0, 1, &psCB);
 				c->CSGetConstantBuffers(0, 1, &csCB);
-				c->VSGetShaderResources(0, 2, vsSRV);
-				c->PSGetShaderResources(0, 2, psSRV);
-				c->CSGetShaderResources(0, 2, csSRV);
+				c->VSGetShaderResources(0, kSlots, vsSRV);
+				c->PSGetShaderResources(0, kSlots, psSRV);
+				c->CSGetShaderResources(0, kSlots, csSRV);
 				c->PSGetSamplers(0, 1, &psSamp);
 				c->CSGetSamplers(0, 1, &csSamp);
 				c->CSGetUnorderedAccessViews(0, 1, &csUAV);
@@ -225,9 +227,9 @@ namespace BloodFX
 				b = vsCB.Get(); c->VSSetConstantBuffers(0, 1, &b);
 				b = psCB.Get(); c->PSSetConstantBuffers(0, 1, &b);
 				b = csCB.Get(); c->CSSetConstantBuffers(0, 1, &b);
-				c->VSSetShaderResources(0, 2, vsSRV);
-				c->PSSetShaderResources(0, 2, psSRV);
-				c->CSSetShaderResources(0, 2, csSRV);
+				c->VSSetShaderResources(0, kSlots, vsSRV);
+				c->PSSetShaderResources(0, kSlots, psSRV);
+				c->CSSetShaderResources(0, kSlots, csSRV);
 				for (auto* s : vsSRV) if (s) s->Release();
 				for (auto* s : psSRV) if (s) s->Release();
 				for (auto* s : csSRV) if (s) s->Release();
@@ -248,6 +250,19 @@ namespace BloodFX
 			r.z = m.m[2][0] * x + m.m[2][1] * y + m.m[2][2] * z + m.m[2][3];
 			r.w = m.m[3][0] * x + m.m[3][1] * y + m.m[3][2] * z + m.m[3][3];
 			return r;
+		}
+
+		// Distance from the camera to the surface stored in a depth sample.
+		float SurfaceDistance(const FrameCB& a_cb, float a_u, float a_v, float a_depth)
+		{
+			XMFLOAT4X4 inv;
+			std::memcpy(&inv, a_cb.invViewProj, sizeof(inv));
+			auto w = ProjectRows(inv, a_u * 2.0f - 1.0f, 1.0f - a_v * 2.0f, a_depth);
+			if (std::fabs(w.w) < 1e-12f) return -1.0f;
+			const float x = w.x / w.w + a_cb.posAdjust[0] - a_cb.camPos[0];
+			const float y = w.y / w.w + a_cb.posAdjust[1] - a_cb.camPos[1];
+			const float z = w.z / w.w + a_cb.posAdjust[2] - a_cb.camPos[2];
+			return std::sqrt(x * x + y * y + z * z);
 		}
 
 		class Sim
@@ -351,6 +366,11 @@ namespace BloodFX
 				// Unbind outputs so the depth texture can be read as SRV.
 				c->OMSetRenderTargets(0, nullptr, nullptr);
 
+				if (_clearRequested.exchange(false)) {
+					const UINT zero[4]{};
+					c->ClearUnorderedAccessViewUint(_particlesUAV.Get(), zero);   // state 0 = dead
+				}
+
 				ID3D11Buffer*              cbs = _cb.Get();
 				ID3D11SamplerState*        smp = _pointClamp.Get();
 				ID3D11UnorderedAccessView* uav = _particlesUAV.Get();
@@ -387,6 +407,10 @@ namespace BloodFX
 					c->CSSetShaderResources(0, 2, none);
 				}
 
+				if (g_settings.debugLog) {
+					Probe(c.Get(), a_in, depthSRV, cb, now);
+				}
+
 				// --- Render ---
 				{
 					D3D11_VIEWPORT vpt{ 0, 0, cb.screenSize[0], cb.screenSize[1], 0, 1 };
@@ -413,6 +437,8 @@ namespace BloodFX
 				saved.Restore(c.Get());
 			}
 
+			void RequestClear() { _clearRequested = true; }
+
 			void OnResize()
 			{
 				_rtv.Reset();
@@ -421,6 +447,110 @@ namespace BloodFX
 
 		private:
 			static constexpr std::uint32_t kMaxBursts = 64;
+			static constexpr UINT          kProbeCount = 22;
+
+			void Probe(ID3D11DeviceContext* c, const FrameInput& a_in, ID3D11ShaderResourceView* a_depth, const FrameCB& a_cb, LARGE_INTEGER a_now)
+			{
+				if (!_probeCS) return;
+
+				if (_probePending) {
+					D3D11_MAPPED_SUBRESOURCE m;
+					if (c->Map(_probeStaging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m) == S_OK) {
+						std::uint32_t raw[kProbeCount];
+						std::memcpy(raw, m.pData, sizeof(raw));
+						c->Unmap(_probeStaging.Get(), 0);
+						_probePending = false;
+
+						static const float pts[5][2] = { { 0.5f, 0.5f }, { 0.5f, 0.85f }, { 0.25f, 0.5f }, { 0.75f, 0.5f }, { 0.5f, 0.15f } };
+						std::string line = "Probe:";
+						for (int t = 0; t < 4; ++t) {
+							char buf[256];
+							std::snprintf(buf, sizeof(buf), " | target %d:", _probeTargets[t]);
+							line += buf;
+							for (int i = 0; i < 5; ++i) {
+								float d;
+								std::memcpy(&d, &raw[t * 5 + i], sizeof(d));
+								std::snprintf(buf, sizeof(buf), " %.5f(%.0fu)", d, SurfaceDistance(_probeCB, pts[i][0], pts[i][1], d));
+								line += buf;
+							}
+						}
+						char buf[128];
+						std::snprintf(buf, sizeof(buf), " | flying %u stuck %u", raw[20], raw[21]);
+						line += buf;
+						Log(0, "%s", line.c_str());
+						Log(0, "  (points: centre, lower-middle, left, right, upper-middle; u = game units from camera)");
+					}
+					return;
+				}
+
+				if (static_cast<float>(a_now.QuadPart - _lastProbe.QuadPart) / static_cast<float>(_freq.QuadPart) < 1.0f) return;
+				_lastProbe = a_now;
+
+				// slot 0 = the target we collide with, then up to 3 other screen-size targets
+				ID3D11ShaderResourceView* extra[3] = { a_depth, a_depth, a_depth };
+				_probeTargets[0] = _depthIndex;
+				_probeTargets[1] = _probeTargets[2] = _probeTargets[3] = _depthIndex;
+				int n = 0;
+				for (int idx : _screenTargets) {
+					if (idx == _depthIndex || n >= 3) continue;
+					if (auto srv = static_cast<ID3D11ShaderResourceView*>(a_in.depthSRVs[idx])) {
+						extra[n] = srv;
+						_probeTargets[1 + n] = idx;
+						++n;
+					}
+				}
+
+				const UINT zero[4]{};
+				c->ClearUnorderedAccessViewUint(_probeUAV.Get(), zero);
+				ID3D11ShaderResourceView*  first = a_depth;
+				ID3D11ShaderResourceView*  rest[4] = { extra[0], extra[1], extra[2], _particlesSRV.Get() };
+				ID3D11UnorderedAccessView* uav = _probeUAV.Get();
+				ID3D11UnorderedAccessView* nullUAV = nullptr;
+				ID3D11Buffer*              cbs = _cb.Get();
+				ID3D11SamplerState*        smp = _pointClamp.Get();
+				c->CSSetShader(_probeCS.Get(), nullptr, 0);
+				c->CSSetConstantBuffers(0, 1, &cbs);
+				c->CSSetSamplers(0, 1, &smp);
+				c->CSSetShaderResources(0, 1, &first);
+				c->CSSetShaderResources(2, 4, rest);
+				c->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+				c->Dispatch((g_settings.maxParticles + 255) / 256, 1, 1);
+				c->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+				ID3D11ShaderResourceView* none[6]{};
+				c->CSSetShaderResources(0, 6, none);
+				c->CopyResource(_probeStaging.Get(), _probeBuf.Get());
+				_probeCB = a_cb;
+				_probePending = true;
+			}
+
+			void InitProbe(ID3D11Device* d)
+			{
+				auto code = Compile(Shaders::kProbeCS, "cs_5_0");
+				if (!code || FAILED(d->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &_probeCS))) {
+					_probeCS.Reset();
+					return;
+				}
+				D3D11_BUFFER_DESC bd{};
+				bd.ByteWidth           = kProbeCount * 4;
+				bd.Usage               = D3D11_USAGE_DEFAULT;
+				bd.BindFlags           = D3D11_BIND_UNORDERED_ACCESS;
+				bd.MiscFlags           = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+				bd.StructureByteStride = 4;
+				if (FAILED(d->CreateBuffer(&bd, nullptr, &_probeBuf)) ||
+					FAILED(d->CreateUnorderedAccessView(_probeBuf.Get(), nullptr, &_probeUAV))) {
+					_probeCS.Reset();
+					return;
+				}
+				D3D11_BUFFER_DESC sd{};
+				sd.ByteWidth      = kProbeCount * 4;
+				sd.Usage          = D3D11_USAGE_STAGING;
+				sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+				if (FAILED(d->CreateBuffer(&sd, nullptr, &_probeStaging))) {
+					_probeCS.Reset();
+					return;
+				}
+				Log(0, "Debug probe enabled (logs once per second)");
+			}
 
 			bool Init(ID3D11Device* d)
 			{
@@ -498,8 +628,11 @@ namespace BloodFX
 				D3D11_DEPTH_STENCIL_DESC ds{};   // depth test is done by hand in the pixel shader
 				d->CreateDepthStencilState(&ds, &_noDepth);
 
+				if (g_settings.debugLog) InitProbe(d);
+
 				QueryPerformanceFrequency(&_freq);
 				QueryPerformanceCounter(&_last);
+				_lastProbe = _last;
 				Log(0, "BloodFX GPU sim ready (%u particles)", n);
 				return true;
 			}
@@ -511,6 +644,7 @@ namespace BloodFX
 				}
 
 				_depthIndex = -1;
+				_screenTargets.clear();
 				for (int i = 0; i < a_in.depthCount; ++i) {
 					auto srv = static_cast<ID3D11ShaderResourceView*>(a_in.depthSRVs[i]);
 					if (!srv) continue;
@@ -521,6 +655,7 @@ namespace BloodFX
 					D3D11_TEXTURE2D_DESC td;
 					tex->GetDesc(&td);
 					const bool match = td.Width == a_w && td.Height == a_h;
+					if (match) _screenTargets.push_back(i);
 					if (!_depthLogged) {
 						Log(0, "Depth target %d: %ux%u fmt %d%s", i, td.Width, td.Height, static_cast<int>(td.Format), match ? " (screen size)" : "");
 					}
@@ -552,28 +687,52 @@ namespace BloodFX
 				XMStoreFloat4x4(&transposed, XMMatrixTranspose(XMLoadFloat4x4(&stored)));
 
 				const float* f = a_in.viewDir;
+				// A point straight ahead must land in the centre of the screen, both near and far.
 				auto centred = [&](const XMFLOAT4X4& m) {
-					auto c = ProjectRows(m, f[0] * 500.0f, f[1] * 500.0f, f[2] * 500.0f);
-					return c.w > 1.0f && std::fabs(c.x / c.w) < 0.1f && std::fabs(c.y / c.w) < 0.1f;
+					for (float dist : { 500.0f, 5000.0f }) {
+						auto c = ProjectRows(m, f[0] * dist, f[1] * dist, f[2] * dist);
+						if (!(c.w > 1.0f && std::fabs(c.x / c.w) < 0.05f && std::fabs(c.y / c.w) < 0.05f)) return false;
+					}
+					return true;
 				};
 
-				const XMFLOAT4X4* m = nullptr;
-				if (centred(stored)) m = &stored;
-				else if (centred(transposed)) m = &transposed;
+				const bool okStored     = centred(stored);
+				const bool okTransposed = centred(transposed);
+				int        candidate    = -1;
+				if (okStored && !okTransposed) candidate = 0;
+				else if (okTransposed && !okStored) candidate = 1;
 
-				if (!m) {
-					if (!_camWarned) Log(2, "Could not interpret camera matrix (will keep trying)");
-					_camWarned = true;
-					return false;
+				// Hysteresis: once settled, only switch after 60 consecutive frames agree.
+				if (_camOrientation < 0) {
+					if (candidate < 0) {
+						if (!_camWarned) Log(2, "Could not interpret camera matrix yet (will keep trying)");
+						_camWarned = true;
+						return false;
+					}
+					_camOrientation = candidate;
+				} else if (candidate >= 0 && candidate != _camOrientation) {
+					if (candidate == _camPendingOrientation) {
+						if (++_camPendingFrames >= 60) {
+							_camOrientation = candidate;
+							_camPendingFrames = 0;
+						}
+					} else {
+						_camPendingOrientation = candidate;
+						_camPendingFrames = 1;
+					}
+				} else {
+					_camPendingFrames = 0;
 				}
 
-				const bool isTransposed = (m == &transposed);
+				const XMFLOAT4X4* m = _camOrientation == 1 ? &transposed : &stored;
+				const bool isTransposed = _camOrientation == 1;
 				auto       nearC = ProjectRows(*m, f[0] * 50.0f, f[1] * 50.0f, f[2] * 50.0f);
 				auto       farC  = ProjectRows(*m, f[0] * 20000.0f, f[1] * 20000.0f, f[2] * 20000.0f);
 				const bool reversed = (nearC.z / nearC.w) > (farC.z / farC.w);
 
 				if (!_camLogged || isTransposed != _lastTransposed || reversed != _lastReversed) {
-					Log(0, "Camera matrix: %s, depth: %s", isTransposed ? "transposed" : "as stored", reversed ? "reversed-Z" : "standard Z");
+					Log(0, "Camera matrix: %s, depth: %s (z at 50u = %.5f, at 20000u = %.5f)", isTransposed ? "transposed" : "as stored",
+						reversed ? "reversed-Z" : "standard Z", nearC.z / nearC.w, farC.z / farC.w);
 					_camLogged = true;
 					_lastTransposed = isTransposed;
 					_lastReversed = reversed;
@@ -609,6 +768,19 @@ namespace BloodFX
 			std::uint32_t      _seed = 1;
 			LARGE_INTEGER      _freq{}, _last{};
 			float              _time = 0.0f;
+
+			ComPtr<ID3D11ComputeShader> _probeCS;
+			ComPtr<ID3D11Buffer>        _probeBuf, _probeStaging;
+			ComPtr<ID3D11UnorderedAccessView> _probeUAV;
+			std::atomic<bool>           _clearRequested{ false };
+			bool                        _probePending = false;
+			LARGE_INTEGER               _lastProbe{};
+			FrameCB                     _probeCB{};
+			int                         _probeTargets[4]{};
+			std::vector<int>            _screenTargets;
+			int                         _camOrientation = -1;   // 0 as stored, 1 transposed
+			int                         _camPendingOrientation = -1;
+			int                         _camPendingFrames = 0;
 
 			int  _depthIndex = -1;
 			UINT _depthW = 0, _depthH = 0;
@@ -670,5 +842,10 @@ namespace BloodFX
 	void QueueBurst(const float a_pos[3], const float a_dir[3], std::uint32_t a_count, float a_speedScale)
 	{
 		g_sim.QueueBurst(a_pos, a_dir, a_count, a_speedScale);
+	}
+
+	void ClearAll()
+	{
+		g_sim.RequestClear();
 	}
 }

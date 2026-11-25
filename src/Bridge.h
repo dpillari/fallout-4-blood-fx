@@ -54,4 +54,5 @@ namespace BloodFX
 	void      SetLogger(LogFn a_fn);
 	bool      InstallPresentHook(void* a_swapChain, FrameInputFn a_frameInput);
 	void      QueueBurst(const float a_pos[3], const float a_dir[3], std::uint32_t a_count, float a_speedScale);
+	void      ClearAll();   // remove all blood (on save load / new game)
 }

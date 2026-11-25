@@ -6,7 +6,7 @@ fxc = sys.argv[1]
 src = (pathlib.Path(__file__).resolve().parent.parent / "src" / "Shaders.h").read_text()
 blocks = dict(re.findall(r'inline constexpr const char\* (\w+) = R"HLSL\((.*?)\)HLSL";', src, re.S))
 common = blocks.pop("kCommon")
-profiles = {"kEmitCS": "cs_5_0", "kUpdateCS": "cs_5_0", "kRenderVS": "vs_5_0", "kRenderPS": "ps_5_0"}
+profiles = {"kEmitCS": "cs_5_0", "kProbeCS": "cs_5_0", "kUpdateCS": "cs_5_0", "kRenderVS": "vs_5_0", "kRenderPS": "ps_5_0"}
 
 failed = False
 with tempfile.TemporaryDirectory() as tmp:

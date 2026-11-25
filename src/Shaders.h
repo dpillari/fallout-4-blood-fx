@@ -218,6 +218,42 @@ VSOut main(uint vid : SV_VertexID)
 }
 )HLSL";
 
+	// ------------------------------------------------------------------
+	// Debug probe: samples 5 screen points from up to 4 depth targets and
+	// counts flying / stuck particles. Read back on the CPU once a second.
+	// Out[0..19] = depth samples (asuint), Out[20] = flying, Out[21] = stuck
+	// ------------------------------------------------------------------
+	inline constexpr const char* kProbeCS = R"HLSL(
+Texture2D<float> Depth1 : register(t2);
+Texture2D<float> Depth2 : register(t3);
+Texture2D<float> Depth3 : register(t4);
+StructuredBuffer<Particle> P : register(t5);
+RWStructuredBuffer<uint> Out : register(u0);
+
+[numthreads(256, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x == 0)
+	{
+		const float2 pts[5] = { float2(0.5, 0.5), float2(0.5, 0.85), float2(0.25, 0.5), float2(0.75, 0.5), float2(0.5, 0.15) };
+		[unroll] for (uint i = 0; i < 5; ++i)
+		{
+			Out[i]      = asuint(SceneDepth.SampleLevel(PointClamp, pts[i], 0));
+			Out[5 + i]  = asuint(Depth1.SampleLevel(PointClamp, pts[i], 0));
+			Out[10 + i] = asuint(Depth2.SampleLevel(PointClamp, pts[i], 0));
+			Out[15 + i] = asuint(Depth3.SampleLevel(PointClamp, pts[i], 0));
+		}
+	}
+	if (id.x < maxParticles)
+	{
+		uint st = P[id.x].state;
+		uint dummy;
+		if (st == 1) InterlockedAdd(Out[20], 1, dummy);
+		else if (st == 2) InterlockedAdd(Out[21], 1, dummy);
+	}
+}
+)HLSL";
+
 	inline constexpr const char* kRenderPS = R"HLSL(
 struct VSOut
 {

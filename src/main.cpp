@@ -118,7 +118,12 @@ namespace
 			dir.Unitize();
 
 			const float scale = std::clamp(hd.totalDamage / 40.0f, 0.5f, 2.5f);
-			Queue(pos, dir, static_cast<std::uint32_t>(BloodFX::GetSettings().dropsPerHit * scale), scale);
+			const auto  count = static_cast<std::uint32_t>(BloodFX::GetSettings().dropsPerHit * scale);
+			if (BloodFX::GetSettings().debugLog) {
+				REX::INFO("Hit {:08X}: pos ({:.0f}, {:.0f}, {:.0f}) dir ({:.2f}, {:.2f}, {:.2f}) damage {:.1f} -> {} drops",
+					actor->GetFormID(), pos.x, pos.y, pos.z, dir.x, dir.y, dir.z, hd.totalDamage, count);
+			}
+			Queue(pos, dir, count, scale);
 			return RE::BSEventNotifyControl::kContinue;
 		}
 	};
@@ -143,6 +148,10 @@ namespace
 
 	void OnMessage(F4SE::MessagingInterface::Message* a_msg)
 	{
+		if (a_msg->type == F4SE::MessagingInterface::kPreLoadGame || a_msg->type == F4SE::MessagingInterface::kNewGame) {
+			BloodFX::ClearAll();
+			return;
+		}
 		if (a_msg->type != F4SE::MessagingInterface::kGameDataReady) return;
 
 		if (auto src = RE::TESHitEvent::GetEventSource()) src->RegisterSink(&g_hitSink);
