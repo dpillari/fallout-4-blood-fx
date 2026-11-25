@@ -105,9 +105,12 @@ namespace
 			auto actor  = target ? target->As<RE::Actor>() : nullptr;
 			if (!actor || !Bleeds(actor)) return RE::BSEventNotifyControl::kContinue;
 
-			const auto&  hd = a_event.hitData;
-			RE::NiPoint3 pos{ hd.impactData.location.x, hd.impactData.location.y, hd.impactData.location.z };
-			RE::NiPoint3 dir{ hd.impactData.velocity.x, hd.impactData.velocity.y, hd.impactData.velocity.z };
+			const auto& hd = a_event.hitData;
+			// DamageImpactData members are private in CommonLibF4; layout is
+			// location @0x00, normal @0x10, velocity @0x20 (each 4 floats).
+			const auto*  impact = reinterpret_cast<const float*>(&hd.impactData);
+			RE::NiPoint3 pos{ impact[0], impact[1], impact[2] };
+			RE::NiPoint3 dir{ impact[8], impact[9], impact[10] };
 			if (pos.x == 0.0f && pos.y == 0.0f && pos.z == 0.0f) pos = ChestPos(actor);
 			if (dir.Length() < 0.01f) dir = { 0.0f, 0.0f, 1.0f };
 			dir.Unitize();

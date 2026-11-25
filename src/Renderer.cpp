@@ -106,7 +106,11 @@ namespace BloodFX
 		std::wstringstream ss(kw);
 		for (std::wstring item; std::getline(ss, item, L',');) {
 			item.erase(std::remove_if(item.begin(), item.end(), ::iswspace), item.end());
-			if (!item.empty()) c.noBloodKeywords.emplace_back(item.begin(), item.end());   // keyword IDs are ASCII
+			if (!item.empty()) {
+				std::string ascii;   // keyword editor IDs are ASCII
+				for (wchar_t ch : item) ascii.push_back(static_cast<char>(ch));
+				c.noBloodKeywords.push_back(std::move(ascii));
+			}
 		}
 		Log(0, "Settings loaded: %u particles, %u drops/hit", c.maxParticles, c.dropsPerHit);
 	}
