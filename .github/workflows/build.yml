@@ -1,0 +1,48 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check shaders (fxc)
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          python tools/check_shaders.py $fxc.FullName
+
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Build
+        shell: pwsh
+        env:
+          XSE_FO4_MODS_PATH: ${{ github.workspace }}\out
+        run: |
+          xmake f -m releasedbg -y
+          xmake build -y -v
+
+      - name: Assemble mod folder
+        shell: pwsh
+        run: |
+          $dst = "out\BloodFX\F4SE\Plugins"
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          Get-ChildItem -Recurse build -Include BloodFX.dll, BloodFX.pdb | Copy-Item -Destination $dst -Force
+          Copy-Item dist\BloodFX.ini $dst -Force
+          Get-ChildItem -Recurse out | Select-Object FullName, Length
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: BloodFX
+          path: out/BloodFX
